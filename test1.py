@@ -1,64 +1,134 @@
 import cv2
+import numpy as np
+import math
+import csv
+from ultralytics import YOLO
+
+# Load YOLO model
+model = YOLO("yolov8n.pt")  # lightweight model
 
 cap = cv2.VideoCapture(0)
-fgbg = cv2.createBackgroundSubtractorMOG2()  # separates background from foreground 
 
-#-------------------------------------------------------------------------------------------------------------
-##                                      BASIC INITIALIZATION OF THE RADAR CAM  
-#-------------------------------------------------------------------------------------------------------------
+id_counter = 0
+objects = {}
 
-if not cap.isOpened():
-    print("Cannot open camera")
-    exit()
+angle = 0
+
+# Create CSV log
+log_file = open("tracking_log.csv", "w", newline="")
+writer = csv.writer(log_file)
+writer.writerow(["Frame", "ID", "Class", "X", "Y", "Speed"])
+
+frame_count = 0
+
 while True:
-    # Capture frame-by-frame
     ret, frame = cap.read()
-
     if not ret:
-        print("Video access failed")
         break
-    else:
-    # 1) applying grayscaling on the feed , implementing background and foreground separator using fgbg 
-        gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)  # converts colors into gray color for easier model learning 
-        frame = cv2.resize(frame, (640, 480))           # resizing frame 
-        fgmask = fgbg.apply(frame)                      # applying masking -> detects the motion in the frames
 
+    frame = cv2.resize(frame, (640, 480))
+    frame_count += 1
 
-    # 2)  removing noise from the mask so noise can be removed for the machine to learn the env more efficiently 
-        kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (5,5))   
-        fgmask = cv2.morphologyEx(fgmask, cv2.MORPH_OPEN, kernel)       # morphology -> removes the noise 
-        fgmask = cv2.morphologyEx(fgmask, cv2.MORPH_CLOSE, kernel)
+    # ================= YOLO DETECTION =================
+    results = model(frame, verbose=False)
 
+    detections = []
 
-    # 3) using contours to detect shapes from white blobs on the radar feed + filtering out small noise particles
+    for r in results:
+        for box in r.boxes:
+            cls_id = int(box.cls[0])
+            label = model.names[cls_id]
 
-        contours, _ = cv2.findContours(fgmask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-        for cnt in contours:
-            if cv2.contourArea(cnt) < 500:        ## tuning parameter. filtering by area. keeping 500 as baseline to allow better detection
-                continue
+            x1, y1, x2, y2 = map(int, box.xyxy[0])
+            cx = (x1 + x2) // 2
+            cy = (y1 + y2) // 2
 
+            detections.append((cx, cy, x1, y1, x2, y2, label))
 
-    # 4) Drawing boxes onto the clean mask for better detection and clarity 
-            x, y, w, h = cv2.boundingRect(cnt)
-            cv2.rectangle(frame, (x,y), (x+w, y+h), (0,255,0), 2)
-                            #starting , #end point ,# colorGBR #thickness
+    new_objects = {}
 
-                            
+    # ================= TRACKING =================
+    for (cx, cy, x1, y1, x2, y2, label) in detections:
 
-    ##----------------------------------------------------------------------------------------------------------##
-    #                  COMPARING POSITIONS ACROSS FRAMES FOR MODEL TO REMEMBER PREVIOUS FRAME 
-    ##----------------------------------------------------------------------------------------------------------##
+        matched_id = None
 
+        for obj_id, points_list in objects.items():
+            px, py = points_list[-1]
 
-    # starting  the radar camera 
-        cv2.imshow("Motion Mask", fgmask)
-        print(frame.shape)
-    
+            distance = ((cx - px)**2 + (cy - py)**2) ** 0.5
 
-    
+            if distance < 50:
+                matched_id = obj_id
+                break
+
+        # MATCHED
+        if matched_id is not None:
+            new_objects[matched_id] = objects[matched_id] + [(cx, cy)]
+            points = new_objects[matched_id]
+            obj_id = matched_id
+
+        # NEW OBJECT
+        else:
+            new_objects[id_counter] = [(cx, cy)]
+            points = new_objects[id_counter]
+            obj_id = id_counter
+            id_counter += 1
+
+        # ================= TRAJECTORY =================
+        for i in range(1, len(points)):
+            cv2.line(frame, points[i-1], points[i], (0,255,255), 2)
+
+        # ================= PREDICTION =================
+        speed = 0
+        if len(points) >= 5:
+            vx_total = 0
+            vy_total = 0
+
+            for i in range(1, 5):
+                x_prev, y_prev = points[-i-1]
+                x_curr, y_curr = points[-i]
+
+                vx_total += (x_curr - x_prev)
+                vy_total += (y_curr - y_prev)
+
+            vx = vx_total / 4
+            vy = vy_total / 4
+
+            pred_x = int(points[-1][0] + vx)
+            pred_y = int(points[-1][1] + vy)
+
+            cv2.circle(frame, (pred_x, pred_y), 6, (0,0,255), -1)
+
+            speed = (vx**2 + vy**2) ** 0.5
+
+        # ================= THREAT =================
+        if speed > 15:
+            threat = "HIGH"
+            color = (0,0,255)
+        elif speed > 5:
+            threat = "MEDIUM"
+            color = (0,255,255)
+        else:
+            threat = "LOW"
+            color = (0,255,0)
+
+        # ================= DRAW =================
+        cv2.rectangle(frame, (x1,y1), (x2,y2), color, 2)
+        cv2.putText(frame, f"{label} ID {obj_id} [{threat}]",
+                    (x1, y1-10),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.5, color, 2)
+
+        # ================= LOGGING =================
+        writer.writerow([frame_count, obj_id, label, cx, cy, speed])
+
+    objects = new_objects
+
+    # ================= DISPLAY =================
+    cv2.imshow("YOLO Tracking System", frame)
+
     if cv2.waitKey(1) & 0xFF == 27:
         break
-        
-# When everything done, release the capture
+
 cap.release()
+log_file.close()
 cv2.destroyAllWindows()
